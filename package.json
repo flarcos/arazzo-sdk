@@ -1,0 +1,57 @@
+{
+  "name": "@flarcos/arazzo-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Parse Arazzo 1.0.1 workflow specifications and generate typed TypeScript SDKs for Open Payments API workflows",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "arazzo-sdk": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "generate": "node dist/cli.js generate --input ../arazzo/*.arazzo.yaml --output src/generated/",
+    "validate": "node dist/cli.js validate --input ../arazzo/*.arazzo.yaml",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "arazzo",
+    "openapi",
+    "open-payments",
+    "interledger",
+    "gnap",
+    "sdk-generator",
+    "workflow",
+    "codegen"
+  ],
+  "author": "flarcos",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/flarcos/interledger"
+  },
+  "homepage": "https://github.com/flarcos/interledger/tree/main/arazzo-sdk",
+  "bugs": {
+    "url": "https://github.com/flarcos/interledger/issues"
+  },
+  "dependencies": {
+    "@flarcos/kiota-authentication-gnap": "^0.1.0",
+    "yaml": "^2.6.0",
+    "glob": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
