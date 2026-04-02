@@ -35,11 +35,11 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/flarcos/interledger"
+    "url": "https://github.com/flarcos/arazzo-sdk"
   },
-  "homepage": "https://github.com/flarcos/interledger/tree/main/arazzo-sdk",
+  "homepage": "https://github.com/flarcos/arazzo-sdk#readme",
   "bugs": {
-    "url": "https://github.com/flarcos/interledger/issues"
+    "url": "https://github.com/flarcos/arazzo-sdk/issues"
   },
   "dependencies": {
     "@flarcos/kiota-authentication-gnap": "^0.1.0",
