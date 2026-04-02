@@ -1,11 +1,12 @@
 {
-  "name": "@flarcos/arazzo-sdk",
-  "version": "0.1.0",
+  "name": "@flarcos/kiota-arazzo",
+  "version": "0.2.0",
   "type": "module",
   "description": "Parse Arazzo 1.0.1 workflow specifications and generate typed TypeScript SDKs for Open Payments API workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
+    "kiota-arazzo": "dist/cli.js",
     "arazzo-sdk": "dist/cli.js"
   },
   "files": [
@@ -40,6 +41,9 @@
   "homepage": "https://github.com/flarcos/arazzo-sdk#readme",
   "bugs": {
     "url": "https://github.com/flarcos/arazzo-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
     "@flarcos/kiota-authentication-gnap": "^0.1.0",

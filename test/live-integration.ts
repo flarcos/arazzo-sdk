@@ -1,33 +1,31 @@
 /**
- * Live Integration Test
+ * Live Integration Test — Full Payment Flow
  *
- * Tests the Arazzo SDK against the real Interledger test network at
- * https://wallet.interledger-test.dev
+ * Executes the complete 9-step one-time payment workflow against the
+ * Interledger test network:
  *
- * This script executes a non-interactive grant flow to create an incoming
- * payment on the recipient's wallet, demonstrating:
- *
- *   1. Wallet address resolution (dynamic server URL discovery)
- *   2. GNAP grant request with HTTP message signatures
- *   3. Incoming payment creation with the acquired token
- *   4. Dynamic token passing between steps
+ *   1. Resolve recipient wallet address
+ *   2. Request incoming payment grant (non-interactive)
+ *   3. Create incoming payment
+ *   4. Resolve sender wallet address
+ *   5. Request quote grant (non-interactive)
+ *   6. Create quote
+ *   7. Request outgoing payment grant (interactive — opens browser)
+ *   8. Continue grant after user consent
+ *   9. Create outgoing payment → money moves!
  *
  * Usage:
  *   npx tsx test/live-integration.ts
- *
- * NOTE: This test uses real testnet wallets. The private keys are for
- * the Interledger test environment only.
  */
 
-import { createPrivateKey, sign, createHash, randomUUID } from 'node:crypto';
-import { parseArazzoFile } from '../src/parser/arazzo-parser.js';
-import { executeWorkflow } from '../src/runtime/workflow-executor.js';
-import type { WorkflowObject, StepObject } from '../src/parser/types.js';
+import { createPrivateKey, sign, createHash, randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { exec } from 'node:child_process';
 import type {
   HttpRequest,
   HttpResponse,
   HttpClient,
-  StepResult,
 } from '../src/runtime/types.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -46,31 +44,36 @@ const RECIPIENT_PRIVATE_KEY = `-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIFNX4jrFI6Xd4EqZlPKAwWBetg/kxB8KP++XmercHU9k
 -----END PRIVATE KEY-----`;
 
+const PAYMENT_AMOUNT = '100'; // €1.00
+
 // ═══════════════════════════════════════════════════════════════════════════
 // HTTP Client with GNAP Signatures
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * HTTP client that signs requests with HTTP Message Signatures (RFC 9421)
- * for GNAP authentication (RFC 9635).
- */
 class SignedHttpClient implements HttpClient {
   private currentToken: string | null = null;
   private privateKeyPem: string;
   private keyId: string;
+  private walletUrl: string;
 
-  constructor(privateKeyPem: string, keyId: string) {
+  constructor(privateKeyPem: string, keyId: string, walletUrl: string) {
     this.privateKeyPem = privateKeyPem;
     this.keyId = keyId;
+    this.walletUrl = walletUrl;
   }
 
-  setToken(token: string) {
+  setToken(token: string | null) {
     this.currentToken = token;
   }
 
   async execute(request: HttpRequest): Promise<HttpResponse> {
     const url = new URL(request.url);
-    const headers = new Headers(request.headers);
+    const headers = new Headers();
+
+    // Copy provided headers
+    for (const [key, value] of Object.entries(request.headers)) {
+      headers.set(key, value);
+    }
 
     // Add authorization if we have a token
     if (this.currentToken) {
@@ -125,7 +128,6 @@ class SignedHttpClient implements HttpClient {
     url: URL,
     headers: Headers,
   ): { base: string; input: string } {
-    // Covered components for GNAP
     const components: string[] = ['"@method"', '"@target-uri"'];
 
     if (headers.has('Authorization')) {
@@ -137,7 +139,6 @@ class SignedHttpClient implements HttpClient {
       components.push('"content-type"');
     }
 
-    // Build signature base
     const lines: string[] = [];
     for (const comp of components) {
       const name = comp.replace(/"/g, '');
@@ -151,7 +152,6 @@ class SignedHttpClient implements HttpClient {
     }
 
     const created = Math.floor(Date.now() / 1000);
-    const keyIdUri = `${SENDER_WALLET}/jwks.json`;
     const params = `(${components.join(' ')});created=${created};keyid="${this.keyId}";alg="ed25519"`;
     lines.push(`"@signature-params": ${params}`);
 
@@ -169,110 +169,309 @@ class SignedHttpClient implements HttpClient {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test: Partial Workflow (Steps 1-3)
+// Local Callback Server for Interactive Grant
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function runLiveTest() {
+function startCallbackServer(): Promise<{
+  callbackUrl: string;
+  waitForCallback: () => Promise<string>;
+  close: () => void;
+}> {
+  return new Promise((resolve) => {
+    let resolveCallback: (interactRef: string) => void;
+    const callbackPromise = new Promise<string>((res) => {
+      resolveCallback = res;
+    });
+
+    const server = createServer((req, res) => {
+      const url = new URL(req.url!, `http://localhost`);
+      const interactRef = url.searchParams.get('interact_ref');
+      const hash = url.searchParams.get('hash');
+
+      console.log(`\n  🔔 Callback received!`);
+      console.log(`  interact_ref: ${interactRef}`);
+      console.log(`  hash: ${hash}`);
+
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`
+        <html>
+          <body style="font-family: system-ui; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #e0e0e0;">
+            <div style="text-align: center;">
+              <h1 style="color: #4ade80;">✅ Payment Authorized!</h1>
+              <p>You can close this tab. The SDK is completing the payment...</p>
+            </div>
+          </body>
+        </html>
+      `);
+
+      if (interactRef) {
+        resolveCallback(interactRef);
+      }
+    });
+
+    server.listen(3344, '127.0.0.1', () => {
+      const addr = server.address() as AddressInfo;
+      const callbackUrl = `http://localhost:${addr.port}/callback`;
+      console.log(`  📡 Callback server listening on ${callbackUrl}`);
+
+      resolve({
+        callbackUrl,
+        waitForCallback: () => callbackPromise,
+        close: () => server.close(),
+      });
+    });
+  });
+}
+
+function openBrowser(url: string) {
+  // macOS
+  exec(`open "${url}"`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Full Payment Flow
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function runFullPaymentFlow() {
   console.log('═══════════════════════════════════════════════════════');
-  console.log('  Arazzo SDK — Live Integration Test');
+  console.log('  Arazzo SDK — Full Payment Flow (Live)');
   console.log('  Network: Interledger Testnet');
+  console.log(`  Sender:    ${SENDER_WALLET}`);
+  console.log(`  Recipient: ${RECIPIENT_WALLET}`);
+  console.log(`  Amount:    €${(parseInt(PAYMENT_AMOUNT) / 100).toFixed(2)} EUR`);
   console.log('═══════════════════════════════════════════════════════\n');
+
+  const httpClient = new SignedHttpClient(SENDER_PRIVATE_KEY, SENDER_KEY_ID, SENDER_WALLET);
 
   // ─── Step 1: Resolve recipient wallet address ───
   console.log('Step 1: Resolving recipient wallet address...');
-  const walletResponse = await fetch(RECIPIENT_WALLET, {
-    headers: { Accept: 'application/json' },
-  });
-  const walletData = await walletResponse.json() as Record<string, unknown>;
-  console.log(`  ✅ Wallet: ${walletData.id}`);
-  console.log(`  ✅ Auth Server: ${walletData.authServer}`);
-  console.log(`  ✅ Resource Server: ${walletData.resourceServer}`);
-  console.log(`  ✅ Asset: ${walletData.assetCode} (scale ${walletData.assetScale})\n`);
+  const recipientWallet = await resolveWallet(RECIPIENT_WALLET);
+  console.log(`  ✅ Auth Server: ${recipientWallet.authServer}`);
+  console.log(`  ✅ Resource Server: ${recipientWallet.resourceServer}\n`);
 
-  const authServer = walletData.authServer as string;
-  const resourceServer = walletData.resourceServer as string;
+  // ─── Step 2: Request grant for incoming payment ───
+  console.log('Step 2: Requesting grant for incoming payment...');
+  httpClient.setToken(null);
 
-  // ─── Step 2: Request non-interactive grant for incoming payment ───
-  console.log('Step 2: Requesting GNAP grant for incoming payment...');
-
-  const httpClient = new SignedHttpClient(SENDER_PRIVATE_KEY, SENDER_KEY_ID);
-
-  const grantBody = {
-    access_token: {
-      access: [
-        {
-          type: 'incoming-payment',
-          actions: ['create', 'read', 'list'],
-          identifier: RECIPIENT_WALLET,
-        },
-      ],
-    },
-    client: SENDER_WALLET,
-  };
-
-  const grantResponse = await httpClient.execute({
-    url: authServer,
+  const ipGrant = await httpClient.execute({
+    url: recipientWallet.authServer,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      access_token: {
+        access: [{
+          type: 'incoming-payment',
+          actions: ['create', 'read'],
+          identifier: RECIPIENT_WALLET,
+        }],
+      },
+      client: SENDER_WALLET,
     },
-    body: grantBody,
   });
 
-  if (grantResponse.status !== 200) {
-    console.error(`  ❌ Grant request failed: ${grantResponse.status}`);
-    console.error(`  Response:`, JSON.stringify(grantResponse.body, null, 2));
+  const ipToken = (ipGrant.body as any).access_token.value;
+  console.log(`  ✅ Token: ${ipToken.substring(0, 20)}...\n`);
+
+  // ─── Step 3: Create incoming payment ───
+  console.log('Step 3: Creating incoming payment...');
+  httpClient.setToken(ipToken);
+
+  const ipResponse = await httpClient.execute({
+    url: `${recipientWallet.resourceServer}/incoming-payments`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      walletAddress: RECIPIENT_WALLET,
+      incomingAmount: {
+        value: PAYMENT_AMOUNT,
+        assetCode: 'EUR',
+        assetScale: 2,
+      },
+    },
+  });
+
+  const incomingPaymentUrl = (ipResponse.body as any).id;
+  console.log(`  ✅ Incoming Payment: ${incomingPaymentUrl}\n`);
+
+  // ─── Step 4: Resolve sender wallet address ───
+  console.log('Step 4: Resolving sender wallet address...');
+  const senderWallet = await resolveWallet(SENDER_WALLET);
+  console.log(`  ✅ Auth Server: ${senderWallet.authServer}`);
+  console.log(`  ✅ Resource Server: ${senderWallet.resourceServer}\n`);
+
+  // ─── Step 5: Request grant for quote ───
+  console.log('Step 5: Requesting grant for quote...');
+  httpClient.setToken(null);
+
+  const quoteGrant = await httpClient.execute({
+    url: senderWallet.authServer,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      access_token: {
+        access: [{
+          type: 'quote',
+          actions: ['create', 'read'],
+        }],
+      },
+      client: SENDER_WALLET,
+    },
+  });
+
+  const quoteToken = (quoteGrant.body as any).access_token.value;
+  console.log(`  ✅ Token: ${quoteToken.substring(0, 20)}...\n`);
+
+  // ─── Step 6: Create quote ───
+  console.log('Step 6: Creating quote...');
+  httpClient.setToken(quoteToken);
+
+  const quoteResponse = await httpClient.execute({
+    url: `${senderWallet.resourceServer}/quotes`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      walletAddress: SENDER_WALLET,
+      receiver: incomingPaymentUrl,
+      method: 'ilp',
+    },
+  });
+
+  const quoteData = quoteResponse.body as any;
+  const quoteId = quoteData.id;
+  console.log(`  ✅ Quote: ${quoteId}`);
+  console.log(`  ✅ Debit:   ${quoteData.debitAmount.value} ${quoteData.debitAmount.assetCode}`);
+  console.log(`  ✅ Receive: ${quoteData.receiveAmount.value} ${quoteData.receiveAmount.assetCode}\n`);
+
+  // ─── Step 7: Request interactive grant for outgoing payment ───
+  console.log('Step 7: Requesting interactive grant for outgoing payment...');
+
+  // Start callback server first
+  const callback = await startCallbackServer();
+  const finishNonce = randomBytes(16).toString('hex');
+
+  httpClient.setToken(null);
+
+  const opGrant = await httpClient.execute({
+    url: senderWallet.authServer,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      access_token: {
+        access: [{
+          type: 'outgoing-payment',
+          actions: ['create', 'read'],
+          identifier: SENDER_WALLET,
+          limits: {
+            debitAmount: quoteData.debitAmount,
+          },
+        }],
+      },
+      client: SENDER_WALLET,
+      interact: {
+        start: ['redirect'],
+        finish: {
+          method: 'redirect',
+          uri: callback.callbackUrl,
+          nonce: finishNonce,
+        },
+      },
+    },
+  });
+
+  const opGrantData = opGrant.body as any;
+
+  if (opGrant.status !== 200) {
+    console.log(`  ❌ Grant request failed: ${opGrant.status}`);
+    console.log(`  Response:`, JSON.stringify(opGrantData, null, 2));
+    callback.close();
     process.exit(1);
   }
 
-  const grantData = grantResponse.body as Record<string, unknown>;
-  const accessTokenObj = grantData.access_token as Record<string, unknown>;
-  const accessToken = accessTokenObj.value as string;
-  console.log(`  ✅ Access token acquired: ${accessToken.substring(0, 20)}...`);
-  console.log(`  ✅ Token expires in: ${accessTokenObj.expires_in}s\n`);
+  const redirectUrl = opGrantData.interact.redirect;
+  const continueToken = opGrantData.continue.access_token.value;
+  const continueUri = opGrantData.continue.uri;
 
-  // ─── Step 3: Create incoming payment ───
-  console.log('Step 3: Creating incoming payment on recipient wallet...');
+  console.log(`  ✅ Redirect URL: ${redirectUrl}`);
+  console.log(`  ✅ Continue URI: ${continueUri}`);
+  console.log(`\n  🌐 Opening browser for consent — please APPROVE the payment...\n`);
 
-  httpClient.setToken(accessToken);
+  // Open browser for user consent
+  openBrowser(redirectUrl);
 
-  const incomingPaymentBody = {
-    walletAddress: RECIPIENT_WALLET,
-    incomingAmount: {
-      value: '100',
-      assetCode: 'EUR',
-      assetScale: 2,
-    },
-  };
+  // Wait for the callback
+  const interactRef = await callback.waitForCallback();
+  callback.close();
 
-  const ipResponse = await httpClient.execute({
-    url: `${resourceServer}/incoming-payments`,
+  console.log(`  ✅ interact_ref received: ${interactRef}\n`);
+
+  // ─── Step 8: Continue grant after consent ───
+  console.log('Step 8: Continuing grant with interact_ref...');
+  httpClient.setToken(continueToken);
+
+  const continueResponse = await httpClient.execute({
+    url: continueUri,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      interact_ref: interactRef,
     },
-    body: incomingPaymentBody,
   });
 
-  if (ipResponse.status === 201) {
-    const ipData = ipResponse.body as Record<string, unknown>;
-    console.log(`  ✅ Incoming payment created!`);
-    console.log(`  ✅ ID: ${ipData.id}`);
-    console.log(`  ✅ Amount: ${(ipData.incomingAmount as Record<string, unknown>)?.value} ${(ipData.incomingAmount as Record<string, unknown>)?.assetCode}`);
-    console.log(`  ✅ Completed: ${ipData.completed}`);
+  const outgoingToken = (continueResponse.body as any).access_token.value;
+  console.log(`  ✅ Outgoing payment token: ${outgoingToken.substring(0, 20)}...\n`);
+
+  // ─── Step 9: Create outgoing payment ───
+  console.log('Step 9: Creating outgoing payment (sending money!)...');
+  httpClient.setToken(outgoingToken);
+
+  const opResponse = await httpClient.execute({
+    url: `${senderWallet.resourceServer}/outgoing-payments`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: {
+      walletAddress: SENDER_WALLET,
+      quoteId: quoteId,
+    },
+  });
+
+  const opData = opResponse.body as any;
+
+  if (opResponse.status === 201) {
+    console.log(`  ✅ Outgoing Payment: ${opData.id}`);
+    console.log(`  ✅ Failed: ${opData.failed}`);
+    console.log(`  ✅ Sent Amount: ${opData.sentAmount?.value} ${opData.sentAmount?.assetCode}`);
+    console.log(`  ✅ Receive Amount: ${opData.receiveAmount?.value} ${opData.receiveAmount?.assetCode}`);
   } else {
-    console.error(`  ❌ Failed: ${ipResponse.status}`);
-    console.error(`  Response:`, JSON.stringify(ipResponse.body, null, 2));
+    console.log(`  ❌ Failed: ${opResponse.status}`);
+    console.log(`  Response:`, JSON.stringify(opData, null, 2));
   }
 
   console.log('\n═══════════════════════════════════════════════════════');
-  console.log('  Test Complete');
+  console.log('  💸 Payment Complete!');
   console.log('═══════════════════════════════════════════════════════');
 }
 
-runLiveTest().catch((err) => {
-  console.error('Fatal error:', err);
+// ═══════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function resolveWallet(walletUrl: string): Promise<{
+  authServer: string;
+  resourceServer: string;
+  assetCode: string;
+  assetScale: number;
+}> {
+  const res = await fetch(walletUrl, {
+    headers: { Accept: 'application/json' },
+  });
+  return res.json() as any;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Run
+// ═══════════════════════════════════════════════════════════════════════════
+
+runFullPaymentFlow().catch((err) => {
+  console.error('\n❌ Fatal error:', err);
   process.exit(1);
 });
