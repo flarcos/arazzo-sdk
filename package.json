@@ -1,6 +1,6 @@
 {
   "name": "@flarcos/kiota-arazzo",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Parse Arazzo 1.0.1 workflow specifications and generate typed TypeScript SDKs for Open Payments API workflows",
   "main": "dist/index.js",

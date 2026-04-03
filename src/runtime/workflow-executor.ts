@@ -586,8 +586,24 @@ function resolveOperationUrl(
   if (step.parameters) {
     for (const param of step.parameters) {
       if (param.in === 'path') {
-        const value = resolveExpression(String(param.value), context);
-        path = path.replace(`{${param.name}}`, encodeURIComponent(String(value)));
+        let value = String(resolveExpression(String(param.value), context));
+
+        // If the value is a full URL (e.g. "http://auth.example.com/continue/<uuid>"),
+        // extract just the last path segment as the ID. This handles the Open Payments
+        // pattern where continue.uri and access_token.manage are full URLs but the
+        // Arazzo workflow uses them as path parameters.
+        if (value.startsWith('http://') || value.startsWith('https://')) {
+          try {
+            const segments = new URL(value).pathname.split('/').filter(Boolean);
+            if (segments.length > 0) {
+              value = segments[segments.length - 1];
+            }
+          } catch {
+            // If URL parsing fails, use the value as-is
+          }
+        }
+
+        path = path.replace(`{${param.name}}`, encodeURIComponent(value));
       }
     }
   }
